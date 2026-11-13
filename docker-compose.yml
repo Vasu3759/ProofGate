@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: proofgate
+      POSTGRES_PASSWORD: proofgate
+      POSTGRES_DB: proofgate
+    ports:
+      - "5432:5432"
+    volumes:
+      - proofgate-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U proofgate -d proofgate"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://proofgate:proofgate@db:5432/proofgate
+      DEMO_MODE: "true"
+      FRONTEND_ORIGIN: http://localhost:3000
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  proofgate-db:
