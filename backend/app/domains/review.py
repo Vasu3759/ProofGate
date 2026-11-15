@@ -2,7 +2,7 @@ import re
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
-from app.domains.ai_engine import call_llm_verification, semantic_nli_fallback
+from app.domains.ai_engine import call_llm_verification, derive_suggestion, parse_numeric_fact, semantic_nli_fallback
 from app.domains.auth import Actor
 from app.models import (
     ApprovedFact,
@@ -18,41 +18,42 @@ from app.models import (
     SubmissionRevision,
 )
 
-CLAIM_RULES = {
-    "fee": re.compile(
-        r"\b(?:completely\s+)?free(?:\s+of\s+(?:fees?|charge))?\s+(?:international\s+)?transfers?\b|\btransfers?\s+(?:are\s+)?free\b",
-        re.I,
-    ),
-    "settlement": re.compile(r"\bavailable\s+instantly\b|\binstant(?:ly)?\b|\bsame[- ]day\b", re.I),
-    "markets": re.compile(r"\b(?:over|more than)\s+(\d+)\s+(?:countries|markets)\b|\b(\d+)\+\s*(?:countries|markets)\b", re.I),
-}
 VALUE_CLAIMS = {
     "fee": re.compile(r"\b(\d+(?:\.\d+)?)%\s+(?:processing\s+)?fee\b", re.I),
     "settlement": re.compile(r"\b(\d+\s*[–-]\s*\d+\s+business\s+days)\b", re.I),
     "markets": re.compile(r"\b(\d+)\s+supported\s+markets\b", re.I),
 }
-VALUE_SOURCES = {
-    "fee": re.compile(r"\b(\d+(?:\.\d+)?)%", re.I),
-    "settlement": re.compile(r"\b(\d+\s*[–-]\s*\d+\s+business\s+days)\b", re.I),
-    "markets": re.compile(r"\b(\d+)\s+supported\s+markets\b", re.I),
-}
-UNSUPPORTED_PROMISE = re.compile(r"\b(?:guaranteed|risk[- ]free|the\s+best|number\s+one|#1)\b", re.I)
 
 
 def _normalized_value(value: str) -> str:
     return re.sub(r"[^0-9.]", "", value)
 
 
-def _suggestion(fact_key: str, fact: ApprovedFact) -> str | None:
-    source = VALUE_SOURCES[fact_key].search(fact.claim_text)
-    if not source:
-        return None
-    value = source.group(1).replace("-", "–")
-    if fact_key == "fee":
-        return f"international transfers, subject to a {value}% processing fee"
-    if fact_key == "settlement":
-        return f"available with settlement in {value}"
-    return f"{value} supported markets"
+def _fact_supports_finding(claim: str, status: str, fact: ApprovedFact) -> bool:
+    """
+    Verify whether the cited ApprovedFact genuinely supports, contradicts, or relates
+    to the specific finding before attaching evidence.
+    """
+    if not fact:
+        return False
+    fact_text = fact.claim_text.lower()
+    claim_lower = claim.lower()
+    params = parse_numeric_fact(fact.claim_text)
+
+    if fact.fact_key == "fee":
+        # Fee claim matches fee, %, or free
+        if any(term in claim_lower for term in ["fee", "%", "free", "zero"]):
+            return True
+    elif fact.fact_key == "settlement":
+        # Settlement matches day, instant, settle, time
+        if any(term in claim_lower for term in ["day", "instant", "settle", "business"]):
+            return True
+    elif fact.fact_key == "markets":
+        # Market claim matches market, country, or count
+        if any(term in claim_lower for term in ["market", "countr", "+", "over", "more"]):
+            return True
+
+    return False
 
 
 def _add_finding(
@@ -80,7 +81,9 @@ def _add_finding(
     )
     db.add(finding)
     db.flush()
-    if fact:
+
+    # Verify that the fact actually supports the finding before linking
+    if fact and _fact_supports_finding(claim, status, fact):
         db.add(FindingEvidence(
             finding_id=finding.id,
             fact_id=fact.id,
@@ -131,14 +134,12 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
     facts_by_key = {fact.fact_key: fact for fact in facts}
     text = revision.content_text
 
-    # Prepare evidence context for AI
     facts_payload = [
         {"fact_key": f.fact_key, "label": f.label, "claim_text": f.claim_text, "version": f.version}
         for f in facts
     ]
     policies_payload = [p.rule_text for p in policy_versions]
 
-    # Attempt Tier 3 (LLM) or fallback to Tier 2 (Semantic NLI)
     ai_result = call_llm_verification(text, facts_payload, policies_payload)
     used_tier = "tier-3-llm"
     if not ai_result:
@@ -150,13 +151,17 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
         None,
     )
 
-    # Ingest AI findings with source evidence linkage
     recorded_claims = set()
     for item in ai_result.get("findings", []):
         claim_str = item["claim_text"]
         matched_key = item.get("matched_fact_key")
         fact = facts_by_key.get(matched_key) if matched_key else None
         
+        # Derive or revalidate suggestion from fact text
+        sug = item.get("suggested_text")
+        if fact and not sug:
+            sug = derive_suggestion(fact.fact_key, fact.claim_text)
+
         _add_finding(
             db,
             actor,
@@ -166,28 +171,29 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
             severity=item["severity"],
             explanation=item["explanation"],
             fact=fact,
-            suggestion=item.get("suggested_text"),
+            suggestion=sug,
             rationale=item.get("rationale"),
             policy=applicable_policy if item["status"] == "policy_violation" else None,
         )
         recorded_claims.add(claim_str.lower())
 
-    # Complement with Tier 1 Deterministic Verification (value match & exact citations)
+    # Tier 1 Deterministic Value Verification (Exact numeric check)
     for fact_key, pattern in VALUE_CLAIMS.items():
         fact = facts_by_key.get(fact_key)
-        source = VALUE_SOURCES[fact_key].search(fact.claim_text) if fact else None
+        params = parse_numeric_fact(fact.claim_text) if fact else {}
         for match in pattern.finditer(text):
             claim_text_val = match.group(0)
             if claim_text_val.lower() in recorded_claims:
                 continue
-            if not fact or not source:
+            if not fact or fact_key not in params:
                 _add_finding(
                     db, actor, run, claim=claim_text_val, status="unverified",
                     severity="high", explanation="No current approved numeric source value is available for comparison.", fact=fact
                 )
                 continue
+
             claim_value = match.group(1)
-            source_value = source.group(1)
+            source_value = str(params[fact_key])
             equal = _normalized_value(claim_value) == _normalized_value(source_value)
             if equal:
                 _add_finding(
@@ -195,7 +201,7 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
                     severity="info", explanation=f"This value is backed by the approved record: {fact.claim_text}", fact=fact
                 )
             else:
-                sug = _suggestion(fact_key, fact)
+                sug = derive_suggestion(fact_key, fact.claim_text)
                 _add_finding(
                     db, actor, run, claim=claim_text_val, status="contradicted",
                     severity="critical", explanation=f"The value conflicts with the current approved record: {fact.claim_text}",

@@ -92,7 +92,16 @@ def pack_review(db: Session, run: ReviewRun):
     audit = db.query(AuditEvent).filter(
         AuditEvent.action == "review.completed",
         AuditEvent.entity_id == run.submission_id,
+        AuditEvent.metadata_json["review_run_id"].as_string() == run.id,
     ).order_by(AuditEvent.created_at.desc()).first()
+    if not audit:
+        # Fallback to matching revision_id if as_string filter syntax is engine-dependent
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "review.completed",
+            AuditEvent.entity_id == run.submission_id,
+        ).order_by(AuditEvent.created_at.desc()).first()
+        if audit and audit.metadata_json.get("review_run_id") != run.id:
+            audit = None
     metadata = audit.metadata_json if audit else {}
 
     return {

@@ -30,7 +30,7 @@ def extract_text_from_file(filename: str, content: bytes) -> str:
                 raise e
             raise HTTPException(status_code=400, detail=f"Failed to parse PDF document: {str(e)}")
 
-    elif ext in ("docx", "doc"):
+    elif ext == "docx":
         try:
             import docx
             doc = docx.Document(io.BytesIO(content))

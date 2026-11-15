@@ -267,7 +267,7 @@ export default function ReviewPage() {
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileUpload}
-                  accept=".pdf,.docx,.doc,.txt,.md"
+                  accept=".pdf,.docx,.txt,.md"
                   style={{ display: "none" }}
                   disabled={uploading}
                 />
