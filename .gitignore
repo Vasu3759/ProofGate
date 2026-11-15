@@ -8,6 +8,14 @@ venv/
 *.py[cod]
 *.db
 .env
+.env*.local
+*.env
+.env.local
+backend/.env
+frontend/.env.local
+*.db
+*.sqlite
+*.sqlite3
 .DS_Store
 dist/
 coverage/

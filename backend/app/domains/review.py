@@ -1,8 +1,8 @@
 import re
 from datetime import datetime, timezone
-
 from sqlalchemy.orm import Session
 
+from app.domains.ai_engine import call_llm_verification, derive_suggestion, parse_numeric_fact, semantic_nli_fallback
 from app.domains.auth import Actor
 from app.models import (
     ApprovedFact,
@@ -18,41 +18,42 @@ from app.models import (
     SubmissionRevision,
 )
 
-CLAIM_RULES = {
-    "fee": re.compile(
-        r"\b(?:completely\s+)?free(?:\s+of\s+(?:fees?|charge))?\s+(?:international\s+)?transfers?\b|\btransfers?\s+(?:are\s+)?free\b",
-        re.I,
-    ),
-    "settlement": re.compile(r"\bavailable\s+instantly\b|\binstant(?:ly)?\b|\bsame[- ]day\b", re.I),
-    "markets": re.compile(r"\b(?:over|more than)\s+(\d+)\s+(?:countries|markets)\b|\b(\d+)\+\s*(?:countries|markets)\b", re.I),
-}
 VALUE_CLAIMS = {
     "fee": re.compile(r"\b(\d+(?:\.\d+)?)%\s+(?:processing\s+)?fee\b", re.I),
     "settlement": re.compile(r"\b(\d+\s*[–-]\s*\d+\s+business\s+days)\b", re.I),
     "markets": re.compile(r"\b(\d+)\s+supported\s+markets\b", re.I),
 }
-VALUE_SOURCES = {
-    "fee": re.compile(r"\b(\d+(?:\.\d+)?)%", re.I),
-    "settlement": re.compile(r"\b(\d+\s*[–-]\s*\d+\s+business\s+days)\b", re.I),
-    "markets": re.compile(r"\b(\d+)\s+supported\s+markets\b", re.I),
-}
-UNSUPPORTED_PROMISE = re.compile(r"\b(?:guaranteed|risk[- ]free|the\s+best|number\s+one|#1)\b", re.I)
 
 
 def _normalized_value(value: str) -> str:
     return re.sub(r"[^0-9.]", "", value)
 
 
-def _suggestion(fact_key: str, fact: ApprovedFact) -> str | None:
-    source = VALUE_SOURCES[fact_key].search(fact.claim_text)
-    if not source:
-        return None
-    value = source.group(1).replace("-", "–")
-    if fact_key == "fee":
-        return f"international transfers, subject to a {value}% processing fee"
-    if fact_key == "settlement":
-        return f"available with settlement in {value}"
-    return f"{value} supported markets"
+def _fact_supports_finding(claim: str, status: str, fact: ApprovedFact) -> bool:
+    """
+    Verify whether the cited ApprovedFact genuinely supports, contradicts, or relates
+    to the specific finding before attaching evidence.
+    """
+    if not fact:
+        return False
+    fact_text = fact.claim_text.lower()
+    claim_lower = claim.lower()
+    params = parse_numeric_fact(fact.claim_text)
+
+    if fact.fact_key == "fee":
+        # Fee claim matches fee, %, or free
+        if any(term in claim_lower for term in ["fee", "%", "free", "zero"]):
+            return True
+    elif fact.fact_key == "settlement":
+        # Settlement matches day, instant, settle, time
+        if any(term in claim_lower for term in ["day", "instant", "settle", "business"]):
+            return True
+    elif fact.fact_key == "markets":
+        # Market claim matches market, country, or count
+        if any(term in claim_lower for term in ["market", "countr", "+", "over", "more"]):
+            return True
+
+    return False
 
 
 def _add_finding(
@@ -66,6 +67,7 @@ def _add_finding(
     explanation: str,
     fact: ApprovedFact | None = None,
     suggestion: str | None = None,
+    rationale: str | None = None,
     policy: PolicyVersion | None = None,
 ) -> Finding:
     finding = Finding(
@@ -79,7 +81,9 @@ def _add_finding(
     )
     db.add(finding)
     db.flush()
-    if fact:
+
+    # Verify that the fact actually supports the finding before linking
+    if fact and _fact_supports_finding(claim, status, fact):
         db.add(FindingEvidence(
             finding_id=finding.id,
             fact_id=fact.id,
@@ -93,17 +97,23 @@ def _add_finding(
         db.add(CorrectionSuggestion(
             finding_id=finding.id,
             suggested_text=suggestion,
-            rationale="Aligns the statement with approved organizational guidance.",
+            rationale=rationale or "Aligns the statement with approved organizational guidance.",
         ))
     return finding
 
 
 def run_review(db: Session, actor: Actor, submission: Submission, revision: SubmissionRevision):
+    """
+    Hybrid Three-Tier Review Pipeline:
+    - Tier 1: Deterministic rules (numbers, disclosures, strict patterns)
+    - Tier 2: Evidence Ledger retrieval & Semantic-NLI verification
+    - Tier 3: Contextual LLM evaluation (tone, nuance, intent-preserving suggestions)
+    """
     run = ReviewRun(
         organization_id=actor.organization.id,
         submission_id=submission.id,
         revision_id=revision.id,
-        pipeline_version="deterministic-v1",
+        pipeline_version="hybrid-v2-ai",
     )
     db.add(run)
     db.flush()
@@ -124,88 +134,101 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
     facts_by_key = {fact.fact_key: fact for fact in facts}
     text = revision.content_text
 
-    for fact_key, pattern in CLAIM_RULES.items():
-        fact = facts_by_key.get(fact_key)
-        for match in pattern.finditer(text):
-            claim = match.group(0)
-            suggestion = None
-            if fact is None:
-                status, severity = "unverified", "high"
-                explanation = "No current approved source record was found. Missing evidence is not proof that the claim is false."
-            elif fact.expires_at and fact.expires_at <= now:
-                status, severity = "unverified", "high"
-                explanation = "The matching approved fact has expired, so this claim cannot be checked against current evidence."
-            elif fact_key == "markets":
-                source = VALUE_SOURCES[fact_key].search(fact.claim_text)
-                claimed = next((value for value in match.groups() if value), None)
-                if source and claimed and int(claimed) > int(source.group(1)):
-                    status, severity = "contradicted", "critical"
-                    explanation = f"The claim exceeds the current approved market count: {fact.claim_text}"
-                    suggestion = _suggestion(fact_key, fact)
-                else:
-                    status, severity = "unverified", "high"
-                    explanation = f"The approved record does not establish this broader wording: {fact.claim_text}"
-            else:
-                source = VALUE_SOURCES[fact_key].search(fact.claim_text)
-                if source:
-                    status, severity = "contradicted", "critical"
-                    explanation = f"The claim conflicts with the current approved record: {fact.claim_text}"
-                    suggestion = _suggestion(fact_key, fact)
-                else:
-                    status, severity = "unverified", "high"
-                    explanation = f"The approved record does not provide enough detail to verify this claim: {fact.claim_text}"
-            _add_finding(db, actor, run, claim=claim, status=status, severity=severity, explanation=explanation, fact=fact, suggestion=suggestion)
+    facts_payload = [
+        {"fact_key": f.fact_key, "label": f.label, "claim_text": f.claim_text, "version": f.version}
+        for f in facts
+    ]
+    policies_payload = [p.rule_text for p in policy_versions]
 
+    ai_result = call_llm_verification(text, facts_payload, policies_payload)
+    used_tier = "tier-3-llm"
+    if not ai_result:
+        ai_result = semantic_nli_fallback(text, facts_payload, policies_payload)
+        used_tier = "tier-2-nli"
+
+    applicable_policy = next(
+        (p for p in policy_versions if "guarantee" in p.rule_text.lower() or "unsupported" in p.rule_text.lower()),
+        None,
+    )
+
+    recorded_claims = set()
+    for item in ai_result.get("findings", []):
+        claim_str = item["claim_text"]
+        matched_key = item.get("matched_fact_key")
+        fact = facts_by_key.get(matched_key) if matched_key else None
+        
+        # Derive or revalidate suggestion from fact text
+        sug = item.get("suggested_text")
+        if fact and not sug:
+            sug = derive_suggestion(fact.fact_key, fact.claim_text)
+
+        _add_finding(
+            db,
+            actor,
+            run,
+            claim=claim_str,
+            status=item["status"],
+            severity=item["severity"],
+            explanation=item["explanation"],
+            fact=fact,
+            suggestion=sug,
+            rationale=item.get("rationale"),
+            policy=applicable_policy if item["status"] == "policy_violation" else None,
+        )
+        recorded_claims.add(claim_str.lower())
+
+    # Tier 1 Deterministic Value Verification (Exact numeric check)
     for fact_key, pattern in VALUE_CLAIMS.items():
         fact = facts_by_key.get(fact_key)
-        source = VALUE_SOURCES[fact_key].search(fact.claim_text) if fact else None
+        params = parse_numeric_fact(fact.claim_text) if fact else {}
         for match in pattern.finditer(text):
-            if not fact or not source:
-                _add_finding(db, actor, run, claim=match.group(0), status="unverified", severity="high", explanation="No current approved numeric source value is available for comparison.", fact=fact)
+            claim_text_val = match.group(0)
+            if claim_text_val.lower() in recorded_claims:
                 continue
-            claim_value = match.group(1)
-            source_value = source.group(1)
-            equal = _normalized_value(claim_value) == _normalized_value(source_value)
-            suggestion = None
-            if equal:
-                status, severity = "supported", "info"
-                explanation = f"This value is backed by the approved record: {fact.claim_text}"
-            elif fact_key == "markets" and int(claim_value) < int(source_value):
-                status, severity = "unverified", "high"
-                explanation = f"The approved record does not establish this exact market count: {fact.claim_text}"
-            else:
-                status, severity = "contradicted", "critical"
-                explanation = f"The value conflicts with the current approved record: {fact.claim_text}"
-                if fact_key in {"fee", "settlement"}:
-                    suggestion = _suggestion(fact_key, fact)
-            _add_finding(db, actor, run, claim=match.group(0), status=status, severity=severity, explanation=explanation, fact=fact, suggestion=suggestion)
+            if not fact or fact_key not in params:
+                _add_finding(
+                    db, actor, run, claim=claim_text_val, status="unverified",
+                    severity="high", explanation="No current approved numeric source value is available for comparison.", fact=fact
+                )
+                continue
 
-    applicable = next((p for p in policy_versions if "guarantee" in p.rule_text.lower() or "unsupported" in p.rule_text.lower()), None)
-    for match in UNSUPPORTED_PROMISE.finditer(text):
-        phrase = match.group(0)
-        _add_finding(
-            db, actor, run, claim=phrase, status="unverified", severity="high",
-            explanation="This promotional promise has no matching approved evidence record. It is unverified, not established as false.",
-            suggestion="Remove this unsupported promise or provide an approved source.",
-        )
-        _add_finding(
-            db, actor, run, claim=phrase, status="policy_violation", severity="high",
-            explanation="The active brand policy prohibits unsupported promotional guarantees. This phrase also lacks an approved evidence record.",
-            policy=applicable,
-        )
+            claim_value = match.group(1)
+            source_value = str(params[fact_key])
+            equal = _normalized_value(claim_value) == _normalized_value(source_value)
+            if equal:
+                _add_finding(
+                    db, actor, run, claim=claim_text_val, status="supported",
+                    severity="info", explanation=f"This value is backed by the approved record: {fact.claim_text}", fact=fact
+                )
+            else:
+                sug = derive_suggestion(fact_key, fact.claim_text)
+                _add_finding(
+                    db, actor, run, claim=claim_text_val, status="contradicted",
+                    severity="critical", explanation=f"The value conflicts with the current approved record: {fact.claim_text}",
+                    fact=fact, suggestion=sug
+                )
 
     has_material_findings = db.query(Finding).filter(
         Finding.review_run_id == run.id,
         Finding.status.in_(["contradicted", "policy_violation"]),
     ).count()
     submission.status = "needs_changes" if has_material_findings else "reviewed"
+
+    metadata = {
+        "revision_id": revision.id,
+        "review_run_id": run.id,
+        "pipeline_engine": used_tier,
+        "tone_score": ai_result.get("tone_score", 100),
+        "detected_tone": ai_result.get("detected_tone", "Neutral"),
+        "tone_summary": ai_result.get("tone_summary", ""),
+    }
     db.add(AuditEvent(
         organization_id=actor.organization.id,
         actor_id=actor.user.id,
         action="review.completed",
         entity_type="submission",
         entity_id=submission.id,
-        metadata_json={"revision_id": revision.id, "review_run_id": run.id},
+        metadata_json=metadata,
     ))
     db.flush()
     return run

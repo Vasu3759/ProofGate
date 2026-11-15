@@ -1,11 +1,13 @@
 from datetime import datetime, timedelta, timezone
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db import get_db
 from app.domains.auth import Actor, get_current_actor, require_roles
+from app.domains.documents import extract_text_from_file
+from app.domains.drift import detect_policy_drift
 from app.domains.review import run_review
 from app.models import (
     ApprovedFact, AuditEvent, BrandPolicy, CorrectionSuggestion, EvidenceSource,
@@ -87,10 +89,31 @@ def pack_review(db: Session, run: ReviewRun):
         })
     policy_ids = [row.policy_version_id for row in db.query(ReviewRunPolicy).filter(ReviewRunPolicy.review_run_id == run.id).all()]
     policies = db.query(PolicyVersion).filter(PolicyVersion.id.in_(policy_ids)).all() if policy_ids else []
+    audit = db.query(AuditEvent).filter(
+        AuditEvent.action == "review.completed",
+        AuditEvent.entity_id == run.submission_id,
+        AuditEvent.metadata_json["review_run_id"].as_string() == run.id,
+    ).order_by(AuditEvent.created_at.desc()).first()
+    if not audit:
+        # Fallback to matching revision_id if as_string filter syntax is engine-dependent
+        audit = db.query(AuditEvent).filter(
+            AuditEvent.action == "review.completed",
+            AuditEvent.entity_id == run.submission_id,
+        ).order_by(AuditEvent.created_at.desc()).first()
+        if audit and audit.metadata_json.get("review_run_id") != run.id:
+            audit = None
+    metadata = audit.metadata_json if audit else {}
+
     return {
         "id": run.id, "revision_id": run.revision_id, "pipeline_version": run.pipeline_version,
         "created_at": run.created_at, "policies": [{"id": p.id, "version": p.version, "rule_text": p.rule_text} for p in policies],
         "findings": result,
+        "ai_metadata": {
+            "pipeline_engine": metadata.get("pipeline_engine", "deterministic-v1"),
+            "tone_score": metadata.get("tone_score", 100),
+            "detected_tone": metadata.get("detected_tone", "Neutral"),
+            "tone_summary": metadata.get("tone_summary", ""),
+        },
     }
 
 
@@ -139,6 +162,18 @@ def knowledge_summary(actor: Actor = Depends(get_current_actor), db: Session = D
     return {"sources": len(sources), "facts": len(facts), "policies": len(policies), "expiring_soon": expiring}
 
 
+@app.get("/api/knowledge/drift")
+def get_drift_report(
+    actor: Actor = Depends(get_current_actor),
+    db: Session = Depends(get_db),
+):
+    """
+    Scans previously approved submissions and flags any that depend on
+    outdated, superseded, or expired brand facts and policies.
+    """
+    return detect_policy_drift(db, actor.organization.id)
+
+
 @app.post("/api/knowledge/facts", status_code=201)
 def create_fact(payload: FactCreate, actor: Actor = Depends(require_roles("admin", "brand_manager")), db: Session = Depends(get_db)):
     source = EvidenceSource(
@@ -172,6 +207,26 @@ def create_fact(payload: FactCreate, actor: Actor = Depends(require_roles("admin
 def list_submissions(actor: Actor = Depends(get_current_actor), db: Session = Depends(get_db)):
     items = db.query(Submission).filter(Submission.organization_id == actor.organization.id).order_by(Submission.created_at.desc()).all()
     return [{"id": s.id, "title": s.title, "channel": s.channel, "status": s.status, "created_at": s.created_at, "revision": latest_revision(db, s).revision_number if latest_revision(db, s) else 0} for s in items]
+
+
+@app.post("/api/documents/extract")
+async def extract_document_text(
+    file: UploadFile = File(...),
+    actor: Actor = Depends(require_roles("admin", "brand_manager", "creator")),
+):
+    """Extract clean text content from an uploaded PDF, DOCX, or text file."""
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds the 10MB limit.")
+    text = extract_text_from_file(file.filename, content)
+    return {
+        "filename": file.filename,
+        "content": text,
+        "character_count": len(text),
+        "word_count": len(text.split()),
+    }
 
 
 @app.post("/api/submissions", status_code=201)
