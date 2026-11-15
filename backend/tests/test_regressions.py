@@ -148,3 +148,95 @@ def test_review_metadata_tied_to_correct_run(client):
     assert run1_id != run2_id
     assert rev2["revision_id"] != rev1["revision_id"]
     assert rev2["ai_metadata"]["pipeline_engine"] in ["tier-3-llm", "tier-2-nli", "deterministic-v1"]
+
+
+def test_llm_finding_must_quote_text_from_the_reviewed_revision(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "One unsupported claim.",
+        "findings": [{
+            "claim_text": "free international transfers",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "This conflicts with the approved fee record.",
+            "matched_fact_key": "fee",
+            "suggested_text": "subject to a 1.5% processing fee",
+            "rationale": "Use the approved fee.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "No Free Claim",
+        "channel": "Web",
+        "content": "MeridianPay serves customers around the world.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    assert response.json()["findings"] == []
+
+
+def test_llm_correction_cannot_override_approved_fact_value(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "Incorrect fee claim.",
+        "findings": [{
+            "claim_text": "completely free",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "This conflicts with the approved fee record.",
+            "matched_fact_key": "fee",
+            "suggested_text": "subject to a 0.5% processing fee",
+            "rationale": "Correction.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Incorrect Fee Correction",
+        "channel": "Web",
+        "content": "Transfers are completely free.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    finding = next(item for item in response.json()["findings"] if item["claim_text"] == "completely free")
+    assert "1.5%" in finding["suggestion"]["text"]
+    assert "0.5%" not in finding["suggestion"]["text"]
+
+
+def test_deterministic_numeric_match_overrides_wrong_llm_status(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "The model misclassified the approved count.",
+        "findings": [{
+            "claim_text": "85 supported markets",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "Model output incorrectly says this is contradicted.",
+            "matched_fact_key": "markets",
+            "suggested_text": "45 supported markets",
+            "rationale": "Incorrect model correction.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Approved Market Count",
+        "channel": "Web",
+        "content": "MeridianPay is available in 85 supported markets.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    findings = [item for item in response.json()["findings"] if item["claim_text"] == "85 supported markets"]
+    assert len(findings) == 1
+    assert findings[0]["status"] == "supported"
+    assert findings[0]["suggestion"] is None

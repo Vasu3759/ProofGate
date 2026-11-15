@@ -2,7 +2,14 @@ import re
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
-from app.domains.ai_engine import call_llm_verification, derive_suggestion, parse_numeric_fact, semantic_nli_fallback
+from app.domains.ai_engine import (
+    call_llm_verification,
+    derive_suggestion,
+    finding_claim_is_grounded,
+    parse_numeric_fact,
+    semantic_nli_fallback,
+    suggestion_matches_fact,
+)
 from app.domains.auth import Actor
 from app.models import (
     ApprovedFact,
@@ -27,6 +34,10 @@ VALUE_CLAIMS = {
 
 def _normalized_value(value: str) -> str:
     return re.sub(r"[^0-9.]", "", value)
+
+
+def _normalized_text(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
 def _fact_supports_finding(claim: str, status: str, fact: ApprovedFact) -> bool:
@@ -154,12 +165,26 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
     recorded_claims = set()
     for item in ai_result.get("findings", []):
         claim_str = item["claim_text"]
+        if not finding_claim_is_grounded(claim_str, text):
+            continue
+
+        # Exact numeric statements are assessed by the deterministic value checker,
+        # which compares them directly with the approved record.
+        if item["status"] == "supported" or any(
+            _normalized_text(match.group(0)) == _normalized_text(claim_str)
+            for pattern in VALUE_CLAIMS.values()
+            if (match := pattern.search(claim_str))
+        ):
+            continue
+
         matched_key = item.get("matched_fact_key")
         fact = facts_by_key.get(matched_key) if matched_key else None
         
-        # Derive or revalidate suggestion from fact text
+        # Reject model suggestions that introduce numeric values outside the cited fact.
         sug = item.get("suggested_text")
-        if fact and not sug:
+        if fact and sug and not suggestion_matches_fact(sug, fact.fact_key, fact.claim_text):
+            sug = derive_suggestion(fact.fact_key, fact.claim_text)
+        elif fact and not sug:
             sug = derive_suggestion(fact.fact_key, fact.claim_text)
 
         _add_finding(

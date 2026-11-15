@@ -61,6 +61,36 @@ def derive_suggestion(fact_key: str, fact_text: str) -> str | None:
     return None
 
 
+def finding_claim_is_grounded(claim_text: str, content: str) -> bool:
+    """Require an LLM finding to quote a contiguous span of the reviewed revision."""
+    normalize = lambda value: " ".join(value.split()).casefold()
+    claim = normalize(claim_text)
+    return bool(claim) and claim in normalize(content)
+
+
+def suggestion_matches_fact(suggestion: str, fact_key: str, fact_text: str) -> bool:
+    """Reject numeric corrections that conflict with the matched approved fact."""
+    params = parse_numeric_fact(fact_text)
+    if fact_key == "fee" and "fee" in params:
+        suggested_values = re.findall(r"\b(\d+(?:\.\d+)?)\s*%", suggestion)
+        return all(value == str(params["fee"]) for value in suggested_values)
+
+    if fact_key == "settlement" and "settlement" in params:
+        normalize = lambda value: re.sub(r"\s+", "", value).replace("-", "–").casefold()
+        suggested_values = re.findall(r"\b\d+\s*[–-]\s*\d+\s+business\s+days\b", suggestion, re.I)
+        return all(normalize(value) == normalize(params["settlement"]) for value in suggested_values)
+
+    if fact_key == "markets" and "markets" in params:
+        suggested_values = re.findall(
+            r"\b(?:(?:over|more than)\s*)?(\d+)\+?\s+(?:supported\s+)?(?:markets|countries)\b",
+            suggestion,
+            re.I,
+        )
+        return all(int(value) == params["markets"] for value in suggested_values)
+
+    return True
+
+
 def call_llm_verification(
     content: str,
     approved_facts: list[dict[str, Any]],

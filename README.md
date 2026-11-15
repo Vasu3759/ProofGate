@@ -111,4 +111,3 @@ Run the full automated test suite covering document ingestion, workflow state tr
 cd backend
 pytest
 ```
-*(All 9 tests pass cleanly).*
