@@ -240,3 +240,52 @@ def test_deterministic_numeric_match_overrides_wrong_llm_status(client, monkeypa
     assert len(findings) == 1
     assert findings[0]["status"] == "supported"
     assert findings[0]["suggestion"] is None
+
+
+def test_unrelated_llm_fact_cannot_support_a_contradiction(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "Unsupported model verdict.",
+        "findings": [{
+            "claim_text": "the world's fastest",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "This conflicts with the approved fee record.",
+            "matched_fact_key": "fee",
+            "suggested_text": "subject to a 1.5% processing fee",
+            "rationale": "Correction.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Unrelated Evidence",
+        "channel": "Web",
+        "content": "Our transfer service is the world's fastest.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    finding = next(item for item in response.json()["findings"] if item["claim_text"] == "the world's fastest")
+    assert finding["status"] == "unverified"
+    assert finding["evidence"] is None
+    assert finding["suggestion"] is None
+
+
+def test_lower_market_count_is_unverified_not_contradicted(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: None)
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Narrow Market Claim",
+        "channel": "Web",
+        "content": "MeridianPay is available in 45 supported markets.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    finding = next(item for item in response.json()["findings"] if item["claim_text"] == "45 supported markets")
+    assert finding["status"] == "unverified"
+    assert finding["evidence"] is None

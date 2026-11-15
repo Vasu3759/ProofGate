@@ -1,5 +1,6 @@
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from sqlalchemy.orm import Session
 
 from app.domains.ai_engine import (
@@ -45,24 +46,46 @@ def _fact_supports_finding(claim: str, status: str, fact: ApprovedFact) -> bool:
     Verify whether the cited ApprovedFact genuinely supports, contradicts, or relates
     to the specific finding before attaching evidence.
     """
-    if not fact:
+    if not fact or status not in {"supported", "contradicted"}:
         return False
-    fact_text = fact.claim_text.lower()
-    claim_lower = claim.lower()
-    params = parse_numeric_fact(fact.claim_text)
+    approved = parse_numeric_fact(fact.claim_text)
 
     if fact.fact_key == "fee":
-        # Fee claim matches fee, %, or free
-        if any(term in claim_lower for term in ["fee", "%", "free", "zero"]):
-            return True
+        approved_fee = approved.get("fee")
+        claim_fee = re.search(r"\b(\d+(?:\.\d+)?)\s*%", claim)
+        if approved_fee is not None and claim_fee:
+            try:
+                equal = Decimal(claim_fee.group(1)) == Decimal(str(approved_fee))
+            except InvalidOperation:
+                return False
+            return equal if status == "supported" else not equal
+        if approved_fee is not None and re.search(r"\b(?:free|zero\s+fees?|no\s+fees?)\b", claim, re.I):
+            try:
+                return status == "contradicted" and Decimal(str(approved_fee)) > 0
+            except InvalidOperation:
+                return False
     elif fact.fact_key == "settlement":
-        # Settlement matches day, instant, settle, time
-        if any(term in claim_lower for term in ["day", "instant", "settle", "business"]):
-            return True
+        approved_range = approved.get("settlement")
+        claim_range = parse_numeric_fact(claim).get("settlement")
+        if approved_range and claim_range:
+            normalize = lambda value: re.sub(r"\s+", "", value).replace("-", "–").casefold()
+            equal = normalize(approved_range) == normalize(claim_range)
+            return equal if status == "supported" else not equal
+        if approved_range and re.search(r"\b(?:instant(?:ly)?|real[- ]time|same[- ]day)\b", claim, re.I):
+            return status == "contradicted"
     elif fact.fact_key == "markets":
-        # Market claim matches market, country, or count
-        if any(term in claim_lower for term in ["market", "countr", "+", "over", "more"]):
-            return True
+        approved_count = approved.get("markets")
+        claim_count = re.search(
+            r"\b(?:(over|more than)\s*)?(\d+)\+?\s*(?:supported\s+)?(?:markets|countries)\b",
+            claim,
+            re.I,
+        )
+        if approved_count is not None and claim_count:
+            claimed = int(claim_count.group(2))
+            if claimed > approved_count:
+                return status == "contradicted"
+            if claimed == approved_count and not claim_count.group(1):
+                return status == "supported"
 
     return False
 
@@ -179,10 +202,24 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
 
         matched_key = item.get("matched_fact_key")
         fact = facts_by_key.get(matched_key) if matched_key else None
+
+        finding_status = item["status"]
+        finding_explanation = item["explanation"]
+        if finding_status == "contradicted" and not _fact_supports_finding(claim_str, finding_status, fact):
+            finding_status = "unverified"
+            finding_explanation = (
+                "No applicable approved record establishes a contradiction for this claim. "
+                "Treat it as unverified until authoritative evidence is available."
+            )
+            fact = None
+        elif finding_status not in {"supported", "contradicted"}:
+            fact = None
         
         # Reject model suggestions that introduce numeric values outside the cited fact.
         sug = item.get("suggested_text")
-        if fact and sug and not suggestion_matches_fact(sug, fact.fact_key, fact.claim_text):
+        if finding_status == "unverified" and not fact:
+            sug = None
+        elif fact and sug and not suggestion_matches_fact(sug, fact.fact_key, fact.claim_text):
             sug = derive_suggestion(fact.fact_key, fact.claim_text)
         elif fact and not sug:
             sug = derive_suggestion(fact.fact_key, fact.claim_text)
@@ -192,9 +229,9 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
             actor,
             run,
             claim=claim_str,
-            status=item["status"],
+            status=finding_status,
             severity=item["severity"],
-            explanation=item["explanation"],
+            explanation=finding_explanation,
             fact=fact,
             suggestion=sug,
             rationale=item.get("rationale"),
@@ -224,6 +261,13 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
                 _add_finding(
                     db, actor, run, claim=claim_text_val, status="supported",
                     severity="info", explanation=f"This value is backed by the approved record: {fact.claim_text}", fact=fact
+                )
+            elif fact_key == "markets" and int(claim_value) < int(source_value):
+                _add_finding(
+                    db, actor, run, claim=claim_text_val, status="unverified",
+                    severity="high",
+                    explanation="The approved record lists broader market coverage but does not establish this narrower count.",
+                    fact=None,
                 )
             else:
                 sug = derive_suggestion(fact_key, fact.claim_text)
