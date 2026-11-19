@@ -15,6 +15,7 @@ const nav = [
   { href: "/workspace/knowledge", number: "02", label: "Brand knowledge" },
   { href: "/workspace/review", number: "03", label: "Review studio" },
   { href: "/workspace/approvals", number: "04", label: "Approvals" },
+  { href: "/workspace/impact", number: "05", label: "Impact radar" },
 ];
 
 export function WorkspaceShell({ children }: { children: React.ReactNode }) {
@@ -40,7 +41,6 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
       <div className="sidebar-label">01&nbsp; WORKSPACE</div>
       <nav className="side-nav" aria-label="Workspace">
         {nav.map((item) => <Link key={item.href} href={item.href} className={`nav-item ${pathname === item.href ? "active" : ""}`}><span>{item.number}</span>{item.label}</Link>)}
-        <div className="nav-item muted" aria-disabled="true"><span>05</span>Impact radar <em>PLANNED</em></div>
       </nav>
       <div className="sidebar-label platform-label">02&nbsp; PLATFORM</div>
       <div className="platform-links"><span>06&nbsp; Analytics</span><span>07&nbsp; Integrations</span><span>08&nbsp; Settings</span></div>

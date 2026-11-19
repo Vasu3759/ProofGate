@@ -5,25 +5,27 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.db import get_db
-from app.domains.auth import Actor, get_current_actor, require_roles
+from app.domains.auth import Actor, create_access_token, get_current_actor, require_roles
 from app.domains.documents import extract_text_from_file
 from app.domains.drift import detect_policy_drift
+from app.domains.impact_graph import build_change_impact_graph, generate_targeted_rereview_tasks
+from app.domains.policy_intelligence import detect_and_index_policy_conflicts, resolve_policy_conflict
 from app.domains.review import run_review
 from app.models import (
     ApprovedFact, AuditEvent, BrandPolicy, CorrectionSuggestion, EvidenceSource,
-    Finding, FindingEvidence, FindingPolicy, Membership, Organization, PolicyVersion,
-    ReviewDecision, ReviewRun, ReviewRunPolicy, Submission, SubmissionRevision,
-    User,
+    Finding, FindingEvidence, FindingPolicy, Membership, Organization, PolicyConflict,
+    PolicyVersion, ReReviewTask, ReviewDecision, ReviewRun, ReviewRunPolicy, Submission,
+    SubmissionRevision, User,
 )
-from app.schemas import DecisionCreate, FactCreate, RevisionCreate, SubmissionCreate
+from app.schemas import DecisionCreate, FactCreate, LoginRequest, PolicyConflictResolve, RevisionCreate, SubmissionCreate
 
-app = FastAPI(title="ProofGate API", version="0.1.0", description="Evidence-backed brand governance. Demo authentication is local-only.")
+app = FastAPI(title="ProofGate API", version="0.3.0", description="Enterprise brand governance platform with change-impact intelligence.")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "X-Demo-User", "X-Organization"],
+    allow_origins=[settings.frontend_origin, "http://localhost:3000", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -119,7 +121,34 @@ def pack_review(db: Session, run: ReviewRun):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "demo_mode": settings.demo_mode}
+    return {"status": "ok", "demo_mode": settings.demo_mode, "version": "0.3.0"}
+
+
+@app.post("/api/auth/token")
+def login_for_access_token(payload: LoginRequest, db: Session = Depends(get_db)):
+    """
+    Production OIDC/JWT Authentication Token Exchange:
+    Issues a cryptographically signed Bearer JWT carrying tenant boundaries and roles.
+    """
+    user = db.query(User).filter(User.email == payload.email.lower()).first()
+    org = db.query(Organization).filter(Organization.slug == payload.organization_slug).first()
+    if not user or not org:
+        raise HTTPException(status_code=401, detail="Invalid credentials or organization.")
+    membership = db.query(Membership).filter(
+        Membership.user_id == user.id,
+        Membership.organization_id == org.id,
+        Membership.active.is_(True),
+    ).first()
+    if not membership:
+        raise HTTPException(status_code=403, detail="User is not an active member of this organization.")
+
+    token = create_access_token(user.id, user.email, org.slug, membership.role)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": {"id": user.id, "email": user.email, "name": user.display_name, "role": membership.role},
+        "organization": {"id": org.id, "name": org.name, "slug": org.slug},
+    }
 
 
 @app.get("/api/me")
@@ -172,6 +201,125 @@ def get_drift_report(
     outdated, superseded, or expired brand facts and policies.
     """
     return detect_policy_drift(db, actor.organization.id)
+
+
+@app.get("/api/policies/conflicts")
+def list_policy_conflicts(
+    actor: Actor = Depends(get_current_actor),
+    db: Session = Depends(get_db),
+):
+    """
+    Policy Conflict Intelligence:
+    Identifies precedence ambiguities, contradictory directives, and overlapping scopes.
+    """
+    conflicts = detect_and_index_policy_conflicts(db, actor.organization.id)
+    output = []
+    for c in conflicts:
+        pv_a = db.query(PolicyVersion).filter(PolicyVersion.id == c.policy_version_a_id).first()
+        pv_b = db.query(PolicyVersion).filter(PolicyVersion.id == c.policy_version_b_id).first()
+        output.append({
+            "id": c.id,
+            "conflict_type": c.conflict_type,
+            "description": c.description,
+            "status": c.status,
+            "policy_a": {
+                "id": pv_a.id,
+                "version": pv_a.version,
+                "scope": pv_a.scope,
+                "precedence": pv_a.precedence,
+                "rule_text": pv_a.rule_text,
+            } if pv_a else None,
+            "policy_b": {
+                "id": pv_b.id,
+                "version": pv_b.version,
+                "scope": pv_b.scope,
+                "precedence": pv_b.precedence,
+                "rule_text": pv_b.rule_text,
+            } if pv_b else None,
+            "created_at": c.created_at,
+        })
+    return output
+
+
+@app.post("/api/policies/conflicts/{conflict_id}/resolve")
+def resolve_conflict_endpoint(
+    conflict_id: str,
+    payload: PolicyConflictResolve,
+    actor: Actor = Depends(require_roles("admin", "brand_manager")),
+    db: Session = Depends(get_db),
+):
+    """Brand managers review and resolve policy conflicts through a recorded audit workflow."""
+    try:
+        resolved = resolve_policy_conflict(
+            db,
+            actor.organization.id,
+            conflict_id,
+            actor.user.id,
+            payload.resolution_notes,
+            payload.winner_version_id,
+            payload.new_precedence,
+        )
+        return {"id": resolved.id, "status": resolved.status, "resolved_at": resolved.resolved_at}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@app.get("/api/impact/graph")
+def get_impact_graph(
+    actor: Actor = Depends(get_current_actor),
+    db: Session = Depends(get_db),
+):
+    """Change-Impact Re-review Graph mapping facts and policies to exact content revisions."""
+    return build_change_impact_graph(db, actor.organization.id)
+
+
+@app.get("/api/impact/tasks")
+def list_rereview_tasks(
+    actor: Actor = Depends(get_current_actor),
+    db: Session = Depends(get_db),
+):
+    """Lists targeted re-review work items so teams recheck only impacted content."""
+    tasks = generate_targeted_rereview_tasks(db, actor.organization.id)
+    output = []
+    for t in tasks:
+        sub = db.query(Submission).filter(Submission.id == t.submission_id).first()
+        output.append({
+            "id": t.id,
+            "submission_id": t.submission_id,
+            "title": sub.title if sub else "Untitled",
+            "channel": sub.channel if sub else "Marketing",
+            "trigger_type": t.trigger_type,
+            "impact_summary": t.impact_summary,
+            "status": t.status,
+            "created_at": t.created_at,
+        })
+    return output
+
+
+@app.post("/api/impact/tasks/{task_id}/resolve")
+def resolve_rereview_task(
+    task_id: str,
+    actor: Actor = Depends(require_roles("admin", "reviewer", "brand_manager")),
+    db: Session = Depends(get_db),
+):
+    """Mark a targeted re-review task as completed or dismissed."""
+    task = db.query(ReReviewTask).filter(
+        ReReviewTask.id == task_id,
+        ReReviewTask.organization_id == actor.organization.id,
+    ).first()
+    if not task:
+        raise HTTPException(status_code=404, detail="Re-review task not found.")
+    task.status = "completed"
+    db.add(AuditEvent(
+        organization_id=actor.organization.id,
+        actor_id=actor.user.id,
+        action="rereview.task_completed",
+        entity_type="rereview_task",
+        entity_id=task.id,
+        metadata_json={"submission_id": task.submission_id},
+    ))
+    db.commit()
+    return {"id": task.id, "status": task.status}
 
 
 @app.post("/api/knowledge/facts", status_code=201)

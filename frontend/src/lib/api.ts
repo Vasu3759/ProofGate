@@ -12,11 +12,15 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const user = typeof window === "undefined"
     ? "alex@meridianlabs.example"
     : localStorage.getItem("proofgate-demo-user") ?? "alex@meridianlabs.example";
+  const token = typeof window !== "undefined" ? localStorage.getItem("proofgate-jwt-token") : null;
   const isFormData = typeof FormData !== "undefined" && init.body instanceof FormData;
   const headers: Record<string, string> = {
     "X-Demo-User": user,
     "X-Organization": "meridian-labs",
   };
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
+  }
   if (!isFormData) {
     headers["Content-Type"] = "application/json";
   }
