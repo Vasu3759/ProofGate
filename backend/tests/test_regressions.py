@@ -28,11 +28,9 @@ def test_85_market_claim_is_supported_not_contradicted(client):
     assert review_res.status_code == 200
     review_data = review_res.json()
 
-    # Finding for 85 supported markets should be supported
     market_findings = [f for f in review_data["findings"] if "85 supported markets" in f["claim_text"]]
     assert len(market_findings) > 0
     assert all(f["status"] == "supported" for f in market_findings)
-    # Ensure no contradicted findings
     assert not any(f["status"] == "contradicted" for f in review_data["findings"])
 
 
@@ -49,7 +47,6 @@ def test_fact_based_dynamic_suggestion(client):
     derived_markets = derive_suggestion("markets", markets_fact)
     assert derived_markets == "85 supported markets"
 
-    # Test in review flow for a contradicted claim
     res = client.post(
         "/api/submissions",
         headers=headers(),
@@ -73,8 +70,6 @@ def test_targeted_policy_and_fact_drift(client):
     Regression test: Only approved submissions that actually depend on a changed/expired
     fact or updated policy version are flagged for drift.
     """
-    # Create two approved submissions:
-    # Sub A cites 'settlement'
     res_a = client.post("/api/submissions", headers=headers(), json={
         "title": "Sub A - Settlement Only",
         "channel": "Web",
@@ -87,7 +82,6 @@ def test_targeted_policy_and_fact_drift(client):
         "decision": "approved", "comments": "Approved settlement wording"
     })
 
-    # Sub B cites 'fee'
     res_b = client.post("/api/submissions", headers=headers(), json={
         "title": "Sub B - Fee Campaign",
         "channel": "Web",
@@ -100,7 +94,6 @@ def test_targeted_policy_and_fact_drift(client):
         "decision": "approved", "comments": "Approved fee wording"
     })
 
-    # Now add a new version of 'fee' (v2)
     client.post("/api/knowledge/facts", headers=headers("morgan@meridianlabs.example"), json={
         "fact_key": "fee",
         "label": "Transfer fee v2",
@@ -110,7 +103,6 @@ def test_targeted_policy_and_fact_drift(client):
         "owner": "Finance",
     })
 
-    # Check drift report: Sub B must drift; Sub A must NOT drift!
     drift_res = client.get("/api/knowledge/drift", headers=headers("morgan@meridianlabs.example"))
     assert drift_res.status_code == 200
     drift_items = drift_res.json()
@@ -132,19 +124,157 @@ def test_review_metadata_tied_to_correct_run(client):
     })
     sub_id = res.json()["id"]
 
-    # Run 1
     rev1 = client.post(f"/api/submissions/{sub_id}/review", headers=headers()).json()
     run1_id = rev1["id"]
     assert rev1["ai_metadata"]["pipeline_engine"] in ["tier-3-llm", "tier-2-nli", "deterministic-v1"]
 
-    # Revise
     client.post(f"/api/submissions/{sub_id}/revisions", headers=headers(), json={
         "content": "Transfers settle in 1–2 business days.",
     })
 
-    # Run 2
     rev2 = client.post(f"/api/submissions/{sub_id}/review", headers=headers()).json()
     run2_id = rev2["id"]
     assert run1_id != run2_id
     assert rev2["revision_id"] != rev1["revision_id"]
     assert rev2["ai_metadata"]["pipeline_engine"] in ["tier-3-llm", "tier-2-nli", "deterministic-v1"]
+
+
+def test_llm_finding_must_quote_text_from_the_reviewed_revision(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "One unsupported claim.",
+        "findings": [{
+            "claim_text": "free international transfers",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "This conflicts with the approved fee record.",
+            "matched_fact_key": "fee",
+            "suggested_text": "subject to a 1.5% processing fee",
+            "rationale": "Use the approved fee.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "No Free Claim",
+        "channel": "Web",
+        "content": "MeridianPay serves customers around the world.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    assert response.json()["findings"] == []
+
+
+def test_llm_correction_cannot_override_approved_fact_value(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "Incorrect fee claim.",
+        "findings": [{
+            "claim_text": "completely free",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "This conflicts with the approved fee record.",
+            "matched_fact_key": "fee",
+            "suggested_text": "subject to a 0.5% processing fee",
+            "rationale": "Correction.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Incorrect Fee Correction",
+        "channel": "Web",
+        "content": "Transfers are completely free.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    finding = next(item for item in response.json()["findings"] if item["claim_text"] == "completely free")
+    assert "1.5%" in finding["suggestion"]["text"]
+    assert "0.5%" not in finding["suggestion"]["text"]
+
+
+def test_deterministic_numeric_match_overrides_wrong_llm_status(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "The model misclassified the approved count.",
+        "findings": [{
+            "claim_text": "85 supported markets",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "Model output incorrectly says this is contradicted.",
+            "matched_fact_key": "markets",
+            "suggested_text": "45 supported markets",
+            "rationale": "Incorrect model correction.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Approved Market Count",
+        "channel": "Web",
+        "content": "MeridianPay is available in 85 supported markets.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    findings = [item for item in response.json()["findings"] if item["claim_text"] == "85 supported markets"]
+    assert len(findings) == 1
+    assert findings[0]["status"] == "supported"
+    assert findings[0]["suggestion"] is None
+
+
+def test_unrelated_llm_fact_cannot_support_a_contradiction(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: {
+        "tone_score": 60,
+        "detected_tone": "Promotional",
+        "tone_summary": "Unsupported model verdict.",
+        "findings": [{
+            "claim_text": "the world's fastest",
+            "status": "contradicted",
+            "severity": "critical",
+            "explanation": "This conflicts with the approved fee record.",
+            "matched_fact_key": "fee",
+            "suggested_text": "subject to a 1.5% processing fee",
+            "rationale": "Correction.",
+        }],
+    })
+
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Unrelated Evidence",
+        "channel": "Web",
+        "content": "Our transfer service is the world's fastest.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    finding = next(item for item in response.json()["findings"] if item["claim_text"] == "the world's fastest")
+    assert finding["status"] == "unverified"
+    assert finding["evidence"] is None
+    assert finding["suggestion"] is None
+
+
+def test_lower_market_count_is_unverified_not_contradicted(client, monkeypatch):
+    from app.domains import review as review_domain
+
+    monkeypatch.setattr(review_domain, "call_llm_verification", lambda *args: None)
+    submission = client.post("/api/submissions", headers=headers(), json={
+        "title": "Narrow Market Claim",
+        "channel": "Web",
+        "content": "MeridianPay is available in 45 supported markets.",
+    }).json()
+    response = client.post(f"/api/submissions/{submission['id']}/review", headers=headers())
+
+    assert response.status_code == 200
+    finding = next(item for item in response.json()["findings"] if item["claim_text"] == "45 supported markets")
+    assert finding["status"] == "unverified"
+    assert finding["evidence"] is None

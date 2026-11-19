@@ -61,6 +61,36 @@ def derive_suggestion(fact_key: str, fact_text: str) -> str | None:
     return None
 
 
+def finding_claim_is_grounded(claim_text: str, content: str) -> bool:
+    """Require an LLM finding to quote a contiguous span of the reviewed revision."""
+    normalize = lambda value: " ".join(value.split()).casefold()
+    claim = normalize(claim_text)
+    return bool(claim) and claim in normalize(content)
+
+
+def suggestion_matches_fact(suggestion: str, fact_key: str, fact_text: str) -> bool:
+    """Reject numeric corrections that conflict with the matched approved fact."""
+    params = parse_numeric_fact(fact_text)
+    if fact_key == "fee" and "fee" in params:
+        suggested_values = re.findall(r"\b(\d+(?:\.\d+)?)\s*%", suggestion)
+        return all(value == str(params["fee"]) for value in suggested_values)
+
+    if fact_key == "settlement" and "settlement" in params:
+        normalize = lambda value: re.sub(r"\s+", "", value).replace("-", "–").casefold()
+        suggested_values = re.findall(r"\b\d+\s*[–-]\s*\d+\s+business\s+days\b", suggestion, re.I)
+        return all(normalize(value) == normalize(params["settlement"]) for value in suggested_values)
+
+    if fact_key == "markets" and "markets" in params:
+        suggested_values = re.findall(
+            r"\b(?:(?:over|more than)\s*)?(\d+)\+?\s+(?:supported\s+)?(?:markets|countries)\b",
+            suggestion,
+            re.I,
+        )
+        return all(int(value) == params["markets"] for value in suggested_values)
+
+    return True
+
+
 def call_llm_verification(
     content: str,
     approved_facts: list[dict[str, Any]],
@@ -145,7 +175,6 @@ Return ONLY a valid JSON object matching this schema:
             if cleaned.endswith("```"):
                 cleaned = cleaned[:-3]
             parsed_raw = json.loads(cleaned.strip())
-            # Schema validation
             validated = LLMReviewOutput.model_validate(parsed_raw)
             return validated.model_dump()
 
@@ -172,7 +201,6 @@ def semantic_nli_fallback(
     findings = []
     tone_flags = []
 
-    # 1. Check tone & hyperbole against policy patterns
     HYPERBOLE_PATTERNS = [
         (re.compile(r"\b(?:guaranteed|100%\s+guarantee|risk[- ]free)\b", re.I), "Promotional Guarantee", "Absolute guarantee violates brand safety rules and consumer protection guidelines."),
         (re.compile(r"\b(?:the\s+best|#1|number\s+one|world['’]?s\s+fastest|unbeatable)\b", re.I), "Unsubstantiated Superlative", "Comparative superlatives require third-party independent audit proof before publication."),
@@ -203,14 +231,12 @@ def semantic_nli_fallback(
                 "rationale": "Aligns copy with regulated brand governance standards.",
             })
 
-    # 2. Check numeric and factual claims dynamically derived from approved_facts
     for fact in approved_facts:
         key = fact.get("fact_key")
         fact_text = fact.get("claim_text", "")
         params = parse_numeric_fact(fact_text)
         suggestion = derive_suggestion(key, fact_text)
 
-        # Fee claim verification
         if key == "fee":
             fee_free_match = re.search(
                 r"\b(?:completely\s+)?free(?:\s+of\s+(?:fees?|charge))?(?:\s+(?:international\s+)?transfers?)?\b|\btransfers?\s+(?:are\s+)?free\b|\bzero\s+fees?\b|\bno\s+fees?\b",
@@ -228,7 +254,6 @@ def semantic_nli_fallback(
                     "rationale": "Prevents deceptive pricing and regulatory penalties.",
                 })
 
-        # Speed / Settlement verification
         if key == "settlement":
             settle_match = re.search(r"\bavailable\s+instantly\b|\binstant(?:ly)?\b|\bsame[- ]day\b|\breal[- ]time\b", content, re.I)
             if settle_match:
@@ -242,7 +267,6 @@ def semantic_nli_fallback(
                     "rationale": "Maintains accurate customer SLA expectations.",
                 })
 
-        # Markets verification
         if key == "markets" and "markets" in params:
             approved_count = params["markets"]
             for m in re.finditer(r"\b(?:over|more than)\s+(\d+)\s+(?:countries|markets)\b|\b(\d+)\+\s*(?:countries|markets)\b|\b(\d+)\s+supported\s+markets\b", content, re.I):

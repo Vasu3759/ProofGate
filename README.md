@@ -1,7 +1,7 @@
 # ProofGate — Round 3: The Finish
 ## Brand Governance with Proof
 
-ProofGate is an enterprise, pre-publication brand governance platform that ensures content complies with approved brand guidelines, commercial facts, and regulatory legal policies. It eliminates factual inaccuracies, tone inconsistencies, policy contradictions, and unverified promotional promises before content reaches the public.
+ProofGate is an enterprise, pre-publication brand governance platform that ensures marketing copy, product briefs, and campaign documents comply with approved brand facts, guidelines, and regulatory legal policies. It eliminates factual inaccuracies, tone inconsistencies, policy contradictions, and unverified promotional promises before content reaches the public.
 
 ---
 
@@ -32,40 +32,64 @@ ProofGate is an enterprise, pre-publication brand governance platform that ensur
 ProofGate inspects content through a multi-tier pipeline:
 1. **Tier 1 (Deterministic Engine)**: Strict regex and numeric verification against approved schedules (fees, SLA settlement periods, geographic footprints).
 2. **Tier 2 (Evidence Ledger & Semantic NLI)**: Compares discrete claims against authoritative, versioned records (`ApprovedFact` & `EvidenceSource`). Classifies missing proof as **`unverified`** rather than falsely labeling it as untrue.
-3. **Tier 3 (Contextual LLM & Tone Scorer)**: Powered by Google Gemini (`google-genai` SDK) with fallback heuristic scoring. Evaluates tone (0–100 score), detects hyperbole, and generates intent-preserving suggested corrections.
+3. **Tier 3 (Contextual LLM & Tone Scorer)**: Powered by Google Gemini (`google-genai` SDK) with fallback heuristic scoring. Evaluates tone (0–100 score), detects hyperbole, validates findings strictly against cited facts, and generates intent-preserving suggested corrections.
+
+---
+
+## Standout Capabilities Delivered
+
+### 1. Multimodal Document Ingestion
+- **Formats Supported**: `.pdf` (`pypdf`), `.docx` (`python-docx`), and `.txt` / `.md`.
+- **Capability**: Creators can upload full marketing documents directly into Review Studio with instant word parsing, paragraph formatting, and automated title assignment.
+
+### 2. Hybrid AI Verification & Grounded Tone Scoring Engine
+- Evaluates submitted content against corporate voice and regulatory safety rules.
+- Computes real-time **AI Tone & Compliance Scores (0–100)** with detected tone classification (e.g. *"Promotional / Unverified"* vs. *"Compliant / Brand-Aligned"*).
+- Detects promotional guarantees and unsubstantiated superlatives (*"the best"*, *"risk-free"*, *"guaranteed"*), offering one-click intent-preserving rewrites.
+- Strictly grounds AI findings and suggestions against approved evidence records.
+
+### 3. Retroactive Policy Drift & Dependency Tracking
+- Pins review runs and approval decisions to the exact version of the evidence records cited.
+- When an `ApprovedFact` is updated (e.g., fee schedule changes from v1 to v2) or expires, the system triggers a retroactive scan across all historical approved submissions.
+- Surfaces a critical **Policy Drift Detected** alert in the Brand Intelligence dashboard and creates targeted work items in the **Impact Radar**.
 
 ---
 
 ## Architecture & Technology Stack
 
-- **Frontend**: Next.js 15, React, TypeScript, Tailwind CSS, TanStack React Query, ProofGate Editorial UI System.
-- **Backend API**: Python 3.11+, FastAPI, Pydantic, SQLAlchemy 2.0, Alembic migrations.
-- **Auth & Security**: PyJWT, Cryptography, HTTPBearer, Role-Based Access Control.
+- **Frontend**: Next.js 15 (App Router), React, TypeScript, Tailwind CSS, TanStack React Query, ProofGate Editorial UI System.
+- **Backend API**: Python 3.11+, FastAPI, Pydantic Settings, SQLAlchemy 2.0, Alembic migrations.
+- **Auth & Security**: PyJWT, Cryptography, HTTPBearer, Role-Based Access Control (RBAC).
 - **AI & Multimodal Ingestion**: Google Gemini API (`google-genai`), PyMuPDF (`pypdf`), `python-docx`, `python-multipart`.
-- **Database**: PostgreSQL (compose) and zero-config local SQLite.
+- **Database**: PostgreSQL (via Docker Compose) and zero-config local SQLite.
 
 ---
 
 ## Running Locally
 
-### Backend Setup
+### 1. Backend Setup
 ```bash
 cd backend
 python -m venv .venv
 
-# On Windows:
+# On Windows PowerShell:
 .\.venv\Scripts\Activate.ps1
 # On Linux/macOS:
 source .venv/bin/activate
 
 pip install -e '.[dev]'
+pip install pypdf python-docx python-multipart google-genai pyjwt cryptography
+
+# Run migrations and seed synthetic records
 alembic upgrade head
 python -m app.seed
+
+# Start the API server
 uvicorn app.main:app --reload --port 8000
 ```
 - API Docs (Swagger): [http://localhost:8000/docs](http://localhost:8000/docs)
 
-### Frontend Setup
+### 2. Frontend Setup
 ```bash
 cd frontend
 npm install
@@ -75,12 +99,38 @@ npm run dev
 
 ---
 
+## How to Test the Core Workflows
+
+### Scenario A: Multimodal Document Review
+1. Open [http://localhost:3000/workspace/review](http://localhost:3000/workspace/review).
+2. In the **`MULTIMODAL INGESTION`** box, click **`SELECT FILE ↗`** and upload `sample_brief.docx` or `sample_campaign.txt`.
+3. Click **`RUN COMPLIANCE ↗`**:
+   - Inspect the **AI Tone & Compliance Score** (e.g. `55/100`).
+   - Review flagged contradictions (fees, settlement, unsupported guarantees) with cited evidence sources.
+   - Click **`APPLY SUGGESTIONS & RECHECK ↗`** to auto-correct the copy.
+4. Click **`SUBMIT REVISION FOR HUMAN REVIEW ↗`**.
+
+### Scenario B: Human Review & Decision
+1. Switch demo identity to **Dana Kim (Reviewer)** using the top workspace header.
+2. Go to **Approvals** ([http://localhost:3000/workspace/approvals](http://localhost:3000/workspace/approvals)).
+3. Open the pending submission, inspect findings, and click **`APPROVE REVISION ↗`**.
+
+### Scenario C: Live Policy Drift Tracking & Impact Radar
+1. Switch identity to **Morgan Lee (Brand Manager)**.
+2. Go to **Brand Knowledge** ([http://localhost:3000/workspace/knowledge](http://localhost:3000/workspace/knowledge)).
+3. Under **`Register an approved fact`**, submit an updated fact:
+   - **Fact Key**: `fee`
+   - **Assertion**: `Subject to a 0.8% processing fee` (new v2 rate)
+4. Navigate to **Impact Radar** ([http://localhost:3000/workspace/impact](http://localhost:3000/workspace/impact)) to inspect the dynamic Change-Impact Graph, active policy conflict resolutions, and the targeted re-review work queue.
+
+---
+
 ## Automated Verification & Test Suite
 
-Run the full automated test suite covering authentication, document extraction, hybrid verification, targeted drift, and policy conflict intelligence:
+Run the full automated test suite covering authentication, document extraction, hybrid verification, grounded corrections, targeted drift, and policy conflict intelligence:
 
 ```bash
 cd backend
 pytest
 ```
-**Results: 16 passed in ~5.8s (100% pass rate).**
+**Results: 21 passed (100% pass rate).**
