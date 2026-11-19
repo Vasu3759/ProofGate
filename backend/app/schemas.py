@@ -38,3 +38,14 @@ class DecisionCreate(BaseModel):
     decision: str
     comments: str = Field(default="", max_length=4000)
     override_justification: str | None = Field(default=None, max_length=2000)
+
+
+class PolicyConflictResolve(BaseModel):
+    resolution_notes: str = Field(min_length=4, max_length=2000)
+    winner_version_id: str | None = None
+    new_precedence: int | None = None
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3)
+    organization_slug: str = Field(default="meridian-labs")

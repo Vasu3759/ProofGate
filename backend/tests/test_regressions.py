@@ -28,11 +28,9 @@ def test_85_market_claim_is_supported_not_contradicted(client):
     assert review_res.status_code == 200
     review_data = review_res.json()
 
-    # Finding for 85 supported markets should be supported
     market_findings = [f for f in review_data["findings"] if "85 supported markets" in f["claim_text"]]
     assert len(market_findings) > 0
     assert all(f["status"] == "supported" for f in market_findings)
-    # Ensure no contradicted findings
     assert not any(f["status"] == "contradicted" for f in review_data["findings"])
 
 
@@ -49,7 +47,6 @@ def test_fact_based_dynamic_suggestion(client):
     derived_markets = derive_suggestion("markets", markets_fact)
     assert derived_markets == "85 supported markets"
 
-    # Test in review flow for a contradicted claim
     res = client.post(
         "/api/submissions",
         headers=headers(),
@@ -73,8 +70,6 @@ def test_targeted_policy_and_fact_drift(client):
     Regression test: Only approved submissions that actually depend on a changed/expired
     fact or updated policy version are flagged for drift.
     """
-    # Create two approved submissions:
-    # Sub A cites 'settlement'
     res_a = client.post("/api/submissions", headers=headers(), json={
         "title": "Sub A - Settlement Only",
         "channel": "Web",
@@ -87,7 +82,6 @@ def test_targeted_policy_and_fact_drift(client):
         "decision": "approved", "comments": "Approved settlement wording"
     })
 
-    # Sub B cites 'fee'
     res_b = client.post("/api/submissions", headers=headers(), json={
         "title": "Sub B - Fee Campaign",
         "channel": "Web",
@@ -100,7 +94,6 @@ def test_targeted_policy_and_fact_drift(client):
         "decision": "approved", "comments": "Approved fee wording"
     })
 
-    # Now add a new version of 'fee' (v2)
     client.post("/api/knowledge/facts", headers=headers("morgan@meridianlabs.example"), json={
         "fact_key": "fee",
         "label": "Transfer fee v2",
@@ -110,7 +103,6 @@ def test_targeted_policy_and_fact_drift(client):
         "owner": "Finance",
     })
 
-    # Check drift report: Sub B must drift; Sub A must NOT drift!
     drift_res = client.get("/api/knowledge/drift", headers=headers("morgan@meridianlabs.example"))
     assert drift_res.status_code == 200
     drift_items = drift_res.json()
@@ -132,17 +124,14 @@ def test_review_metadata_tied_to_correct_run(client):
     })
     sub_id = res.json()["id"]
 
-    # Run 1
     rev1 = client.post(f"/api/submissions/{sub_id}/review", headers=headers()).json()
     run1_id = rev1["id"]
     assert rev1["ai_metadata"]["pipeline_engine"] in ["tier-3-llm", "tier-2-nli", "deterministic-v1"]
 
-    # Revise
     client.post(f"/api/submissions/{sub_id}/revisions", headers=headers(), json={
         "content": "Transfers settle in 1–2 business days.",
     })
 
-    # Run 2
     rev2 = client.post(f"/api/submissions/{sub_id}/review", headers=headers()).json()
     run2_id = rev2["id"]
     assert run1_id != run2_id

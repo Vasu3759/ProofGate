@@ -116,7 +116,6 @@ def _add_finding(
     db.add(finding)
     db.flush()
 
-    # Verify that the fact actually supports the finding before linking
     if fact and _fact_supports_finding(claim, status, fact):
         db.add(FindingEvidence(
             finding_id=finding.id,
@@ -155,7 +154,8 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
     policy_versions = db.query(PolicyVersion).filter(
         PolicyVersion.organization_id == actor.organization.id,
         PolicyVersion.approval_status == "approved",
-    ).all()
+    ).order_by(PolicyVersion.precedence.asc()).all()
+
     for policy in policy_versions:
         db.add(ReviewRunPolicy(review_run_id=run.id, policy_version_id=policy.id))
 
@@ -191,8 +191,6 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
         if not finding_claim_is_grounded(claim_str, text):
             continue
 
-        # Exact numeric statements are assessed by the deterministic value checker,
-        # which compares them directly with the approved record.
         if item["status"] == "supported" or any(
             _normalized_text(match.group(0)) == _normalized_text(claim_str)
             for pattern in VALUE_CLAIMS.values()
@@ -214,8 +212,7 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
             fact = None
         elif finding_status not in {"supported", "contradicted"}:
             fact = None
-        
-        # Reject model suggestions that introduce numeric values outside the cited fact.
+
         sug = item.get("suggested_text")
         if finding_status == "unverified" and not fact:
             sug = None
@@ -239,7 +236,6 @@ def run_review(db: Session, actor: Actor, submission: Submission, revision: Subm
         )
         recorded_claims.add(claim_str.lower())
 
-    # Tier 1 Deterministic Value Verification (Exact numeric check)
     for fact_key, pattern in VALUE_CLAIMS.items():
         fact = facts_by_key.get(fact_key)
         params = parse_numeric_fact(fact.claim_text) if fact else {}

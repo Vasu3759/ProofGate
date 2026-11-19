@@ -84,7 +84,38 @@ class PolicyVersion(Base):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     rule_text: Mapped[str] = mapped_column(Text, nullable=False)
     approval_status: Mapped[str] = mapped_column(String(24), default="approved", nullable=False)
+    precedence: Mapped[int] = mapped_column(Integer, default=100, nullable=False)  # Lower number = higher priority
+    scope: Mapped[str] = mapped_column(String(100), default="global", nullable=False)  # e.g. "global", "social", "financial", "pricing"
     effective_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class PolicyConflict(Base):
+    __tablename__ = "policy_conflicts"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    policy_version_a_id: Mapped[str] = mapped_column(ForeignKey("policy_versions.id", ondelete="CASCADE"), index=True)
+    policy_version_b_id: Mapped[str] = mapped_column(ForeignKey("policy_versions.id", ondelete="CASCADE"), index=True)
+    conflict_type: Mapped[str] = mapped_column(String(40), nullable=False)  # "precedence_overlap", "scope_contradiction"
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="unresolved", nullable=False)  # "unresolved", "resolved"
+    resolved_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    resolution_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+
+class ReReviewTask(Base):
+    __tablename__ = "rereview_tasks"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    organization_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    submission_id: Mapped[str] = mapped_column(ForeignKey("submissions.id", ondelete="CASCADE"), index=True)
+    revision_id: Mapped[str] = mapped_column(ForeignKey("submission_revisions.id", ondelete="CASCADE"), index=True)
+    trigger_type: Mapped[str] = mapped_column(String(32), nullable=False)  # "fact_updated", "fact_expired", "policy_updated"
+    trigger_source_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    impact_summary: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(24), default="pending", nullable=False)  # "pending", "in_progress", "completed", "dismissed"
+    assigned_to: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
 
 
 class Submission(Base):
