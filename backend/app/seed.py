@@ -40,7 +40,23 @@ def seed():
         policy = BrandPolicy(organization_id=ORG_ID, name="External product claims", status="active")
         db.add(policy)
         db.flush()
-        db.add(PolicyVersion(organization_id=ORG_ID, policy_id=policy.id, version=1, rule_text="External product facts must match current approved records. Unsupported guarantees must not be published.", approval_status="approved", effective_at=datetime(2026, 11, 6, tzinfo=timezone.utc)))
+        db.add(PolicyVersion(
+            organization_id=ORG_ID, policy_id=policy.id, version=1,
+            rule_text="External product facts must match current approved records. Unsupported guarantees must not be published.",
+            approval_status="approved", precedence=10, scope="global",
+            effective_at=datetime(2026, 11, 6, tzinfo=timezone.utc),
+        ))
+
+        # Seed a second policy with identical priority & scope to demonstrate Round 3 Policy Conflict Intelligence
+        policy2 = BrandPolicy(organization_id=ORG_ID, name="Regional promotional incentives", status="active")
+        db.add(policy2)
+        db.flush()
+        db.add(PolicyVersion(
+            organization_id=ORG_ID, policy_id=policy2.id, version=1,
+            rule_text="Promotional fee guarantees and superlative claims are permitted with qualified disclosure statements.",
+            approval_status="approved", precedence=10, scope="global",
+            effective_at=datetime(2026, 11, 6, tzinfo=timezone.utc),
+        ))
         db.commit()
     finally:
         db.close()
