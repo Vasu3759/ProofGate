@@ -155,21 +155,6 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
                 ))}
               </select>
             </label>
-            <button
-              onClick={handleLogout}
-              style={{
-                marginLeft: "0.75rem",
-                background: "#181818",
-                border: "1px solid #333",
-                color: "#aaa",
-                padding: "4px 10px",
-                fontSize: "0.75rem",
-                cursor: "pointer",
-                borderRadius: "2px",
-              }}
-            >
-              LOGOUT
-            </button>
           </div>
         </div>
         <div className="workspace-content">{children}</div>
